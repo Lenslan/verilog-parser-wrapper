@@ -47,7 +47,7 @@ impl SignalType {
             ast_net_type_e_NET_TYPE_WIRE => SignalType::Wire,
             ast_net_type_e_NET_TYPE_TRI => SignalType::Tri,
             ast_net_type_e_NET_TYPE_TRIREG => SignalType::Reg, // trireg 也是一种 reg
-            _ => SignalType::Wire, // Verilog 默认是 wire
+            _ => SignalType::Unknown, // Verilog 默认是 wire
         }
     }
 }
@@ -221,8 +221,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
+    fn it_works() -> Result<(), String> {
         let result = add(2, 2);
         assert_eq!(result, 4);
+
+        let ast = VerilogAST::parse_file(&Path::new("tests/std-7.1.6-primitives.v"))?;
+        let ast = VerilogAST::parse_file(&Path::new("tests/macros.v"))?;
+        for module in ast {
+            println!("module name is : {}", module.name);
+            for port in module.ports {
+                println!("Ports messages are: {:?}", port)
+            }
+            println!("module over ----");
+        }
+        // assert_eq!(ast[0].name, String::from("bus_snooper"), " module name is unequal");
+        // assert_eq!(ast[0].ports[0].name, String::from("safe_buslines"), "port name is unequal");
+        // assert_eq!(ast[0].ports[0].lsb, Some(0), "port lsb is unequal");
+        // assert_eq!(ast[0].ports[0].msb, Some(31), "port msb is unequal");
+        // assert_eq!(ast[0].ports[1].name, String::from("bus_lines_1"), "port2 name is unequal");
+        // assert_eq!(ast[0].ports[1].direction, PortDirection::Input, "port direction is unequal");
+
+
+
+        Ok(())
     }
 }

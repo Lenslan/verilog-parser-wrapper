@@ -14,8 +14,8 @@ fn main() {
             format!("{}/verilog_ast_util.c", c_src_dir),
             format!("{}/verilog_parser_wrapper.c", c_src_dir),
             format!("{}/verilog_preprocessor.c", c_src_dir),
-            format!("{}/build/verilog_parser.tab.c", c_src_dir),
-            format!("{}/build/verilog_scanner.c", c_src_dir),
+            format!("build/verilog_parser.tab.c"),
+            format!("build/verilog_scanner.c"),
         ])
         .include(c_src_dir)
         .warnings(false)
