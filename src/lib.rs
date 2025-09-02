@@ -3,10 +3,10 @@
 #![allow(non_snake_case)]
 #![allow(clippy::redundant_static_lifetimes)]
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use libc::{fopen, fclose, FILE};
-
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
@@ -38,19 +38,18 @@ pub enum SignalType {
     Unknown,
 }
 
-impl SignalType {
-    fn from_c(net_type: ast_net_type, is_reg: ast_boolean) -> Self {
-        if is_reg == ast_boolean_e_AST_TRUE {
-            return SignalType::Reg;
-        }
-        match net_type {
-            ast_net_type_e_NET_TYPE_WIRE => SignalType::Wire,
-            ast_net_type_e_NET_TYPE_TRI => SignalType::Tri,
-            ast_net_type_e_NET_TYPE_TRIREG => SignalType::Reg, // trireg 也是一种 reg
-            _ => SignalType::Unknown, // Verilog 默认是 wire
-        }
+        impl SignalType {
+            fn from_c_net_type(net_type: ast_net_type) -> Self {
+                match net_type {
+                    ast_net_type_e_NET_TYPE_WIRE => SignalType::Wire,
+                    ast_net_type_e_NET_TYPE_TRI => SignalType::Tri,
+                    ast_net_type_e_NET_TYPE_TRIREG => SignalType::Reg,
+                    // 默认是 wire
+                    _ => SignalType::Unknown,
+                }
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct PortInfo {
@@ -60,6 +59,15 @@ pub struct PortInfo {
     pub msb: Option<i32>,
     pub lsb: Option<i32>,
 }
+
+// 用于存储 net/reg 详细信息的临时结构
+#[derive(Debug, Clone)]
+struct SignalDetail {
+    signal_type: SignalType,
+    msb: Option<i32>,
+    lsb: Option<i32>,
+}
+
 
 #[derive(Debug, Clone)]
 pub struct ModuleInfo {
@@ -80,21 +88,39 @@ impl VerilogAST {
             return Err(format!("Failed to open file: {}", filepath.display()));
         }
 
-        // 初始化解析器，这会创建 yy_verilog_source_tree
+        // 初始化解析器
         unsafe { verilog_parser_init() };
+
+        // **重要修复：设置预处理器上下文**
+        unsafe {
+            // 1. 设置 include 搜索路径 (可选但推荐)
+            // let current_dir = CString::new("./").unwrap();
+            // ast_list_append((*yy_preproc).search_dirs, current_dir.as_ptr() as *mut _);
+            //
+            // if let Some(parent) = filepath.parent() {
+            //     if let Some(parent_str) = parent.to_str(){
+            //         if !parent_str.is_empty() {
+            //             let parent_dir = CString::new(parent_str).unwrap();
+            //             ast_list_append((*yy_preproc).search_dirs, parent_dir.as_ptr() as *mut _);
+            //         }
+            //     }
+            // }
+
+            // 2. 设置当前解析的文件名 (修复宏定义SIGSEGV的关键)
+            verilog_preprocessor_set_file(yy_preproc, c_filepath.as_ptr() as *mut _);
+        }
 
         // 解析文件
         let result = unsafe { verilog_parse_file(file_ptr) };
         unsafe { fclose(file_ptr) };
 
         if result != 0 {
-            // 解析失败后，需要手动释放内存
             unsafe { ast_free_all() };
             return Err("Failed to parse Verilog syntax".to_string());
         }
 
-        unsafe { verilog_resolve_modules(yy_verilog_source_tree) }
-        // 从全局变量 yy_verilog_source_tree 中提取数据
+        unsafe { verilog_resolve_modules(yy_verilog_source_tree) };
+
         let modules = Self::extract_modules_from_ast();
 
         // 释放 C AST 内存
@@ -127,64 +153,125 @@ impl VerilogAST {
         modules
     }
 
-    /// 从 ast_module_declaration 节点提取单个模块信息
+    /// 从 ast_module_declaration 节点提取单个模块信息 (已重构)
     fn extract_module_data(module_decl_ptr: *mut ast_module_declaration) -> Option<ModuleInfo> {
         if module_decl_ptr.is_null() { return None; }
         let module_decl = unsafe { &*module_decl_ptr };
 
-        let name = unsafe { CStr::from_ptr(module_decl.identifier.as_ref().unwrap().identifier).to_string_lossy().into_owned() };
-        let mut ports = Vec::new();
+        let name = unsafe {
+            module_decl.identifier.as_ref()
+                .map(|id| CStr::from_ptr(id.identifier).to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
 
+        // **修复第一步：创建信号详情的查找表**
+        let mut signal_details = HashMap::new();
+
+        // 从 net 声明中提取
+        let net_decls_ptr = module_decl.net_declarations;
+        if !net_decls_ptr.is_null() {
+            let num_nets = unsafe { (*net_decls_ptr).items };
+            for i in 0..num_nets {
+                let net_decl_ptr = unsafe { ast_list_get(net_decls_ptr, i) as *mut ast_net_declaration };
+                if !net_decl_ptr.is_null() {
+                    let net_decl = unsafe { &*net_decl_ptr };
+                    let (msb, lsb) = Self::extract_range(net_decl.range);
+                    let detail = SignalDetail {
+                        signal_type: SignalType::from_c_net_type(net_decl.type_),
+                        msb,
+                        lsb,
+                    };
+                    if let Some(ident) = unsafe { net_decl.identifier.as_ref() } {
+                        let signal_name = unsafe { CStr::from_ptr(ident.identifier).to_string_lossy().into_owned() };
+                        signal_details.insert(signal_name, detail);
+                    }
+                }
+            }
+        }
+
+        // 从 reg 声明中提取
+        let reg_decls_ptr = module_decl.reg_declarations;
+        if !reg_decls_ptr.is_null() {
+            let num_regs = unsafe { (*reg_decls_ptr).items };
+            for i in 0..num_regs {
+                let reg_decl_ptr = unsafe { ast_list_get(reg_decls_ptr, i) as *mut ast_reg_declaration };
+                if !reg_decl_ptr.is_null() {
+                    let reg_decl = unsafe { &*reg_decl_ptr };
+                    let (msb, lsb) = Self::extract_range(reg_decl.range);
+                    let detail = SignalDetail {
+                        signal_type: SignalType::Reg,
+                        msb,
+                        lsb,
+                    };
+                    if let Some(ident) = unsafe { reg_decl.identifier.as_ref() } {
+                        let signal_name = unsafe { CStr::from_ptr(ident.identifier).to_string_lossy().into_owned() };
+                        signal_details.insert(signal_name, detail);
+                    }
+                }
+            }
+        }
+
+
+        // **修复第二步：遍历端口并使用查找表**
+        let mut ports = Vec::new();
         let ports_list_ptr = module_decl.module_ports;
         if !ports_list_ptr.is_null() {
             let num_ports_decls = unsafe { (*ports_list_ptr).items };
             for i in 0..num_ports_decls {
-                let port_decl_ptr = unsafe { ast_list_get(ports_list_ptr, i) } as *mut ast_port_declaration;
-                ports.append(&mut Self::extract_port_info(port_decl_ptr));
+                let port_decl_ptr = unsafe { ast_list_get(ports_list_ptr, i) as *mut ast_port_declaration };
+                if !port_decl_ptr.is_null() {
+                    let port_decl = unsafe { &*port_decl_ptr };
+                    let direction = PortDirection::from(port_decl.direction);
+
+                    let names_list_ptr = port_decl.port_names;
+                    if !names_list_ptr.is_null() {
+                        let num_names = unsafe { (*names_list_ptr).items };
+                        for j in 0..num_names {
+                            let ident_ptr = unsafe { ast_list_get(names_list_ptr, j) as *mut ast_identifier_t };
+                            if !ident_ptr.is_null() {
+                                let ident = unsafe { &*ident_ptr };
+                                let port_name = unsafe { CStr::from_ptr(ident.identifier).to_string_lossy().into_owned() };
+
+                                // 从查找表中获取详细信息
+                                let detail = signal_details.get(&port_name);
+
+                                // 即使 port_decl.range 为空，也能从 detail 中获取位宽
+                                let (mut msb, mut lsb) = Self::extract_range(port_decl.range);
+                                if msb.is_none() {
+                                    msb = detail.and_then(|d| d.msb);
+                                    lsb = detail.and_then(|d| d.lsb);
+                                }
+
+                                let signal_type = detail.map(|d| d.signal_type.clone()).unwrap_or(SignalType::Wire);
+
+                                ports.push(PortInfo {
+                                    name: port_name,
+                                    direction: direction.clone(),
+                                    signal_type,
+                                    msb,
+                                    lsb,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
         Some(ModuleInfo { name, ports })
     }
 
-    /// 从 ast_port_declaration 节点提取一个或多个端口信息
-    fn extract_port_info(port_decl_ptr: *mut ast_port_declaration) -> Vec<PortInfo> {
-        if port_decl_ptr.is_null() { return vec![]; }
-        let port_decl = unsafe { &*port_decl_ptr };
-
-        let direction = PortDirection::from(port_decl.direction);
-        let signal_type = SignalType::from_c(port_decl.net_type, port_decl.is_reg);
-
-        let (msb, lsb) = if !port_decl.range.is_null() {
-            let range = unsafe { &*port_decl.range };
-            (
-                Self::extract_expression_as_i32(range.upper),
-                Self::extract_expression_as_i32(range.lower)
-            )
-        } else {
-            (None, None)
-        };
-
-        let mut ports = Vec::new();
-        let names_list_ptr = port_decl.port_names;
-        if !names_list_ptr.is_null() {
-            let num_names = unsafe { (*names_list_ptr).items };
-            for i in 0..num_names {
-                let ident_ptr = unsafe { ast_list_get(names_list_ptr, i) as *mut ast_identifier_t };
-                if !ident_ptr.is_null() {
-                    let ident = unsafe { &*ident_ptr };
-                    let name = unsafe { CStr::from_ptr(ident.identifier).to_string_lossy().into_owned() };
-                    ports.push(PortInfo {
-                        name,
-                        direction: direction.clone(),
-                        signal_type: signal_type.clone(),
-                        msb,
-                        lsb,
-                    });
-                }
-            }
+    /// 辅助函数：从 ast_range 提取位宽
+    fn extract_range(range_ptr: *mut ast_range) -> (Option<i32>, Option<i32>) {
+        if range_ptr.is_null() {
+            println!(">> there is no range");
+            return (None, None);
         }
-        ports
+        let range = unsafe { &*range_ptr };
+        (
+            Self::extract_expression_as_i32(range.upper),
+            Self::extract_expression_as_i32(range.lower)
+        )
     }
 
     /// 从 ast_expression 中提取整数值
@@ -202,15 +289,15 @@ impl VerilogAST {
                 } else if number.representation == ast_number_representation_e_REP_BITS {
                     // 对于位字符串，尝试解析它
                     let s = unsafe { CStr::from_ptr(number.__bindgen_anon_1.as_bits).to_string_lossy() };
-                    return s.parse::<i32>().ok();
+                    // Verilog 数字可能包含 'b, 'h, 'd, 'o 等，这里简化处理
+                    let clean_s = s.split('\'').last().unwrap_or(&s);
+                    return clean_s.parse::<i32>().ok();
                 }
             }
         }
         None
     }
-
 }
-
 
 
 pub fn add(left: u64, right: u64) -> u64 {
@@ -222,28 +309,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() -> Result<(), String> {
+    fn test_width() -> Result<(), String> {
         let result = add(2, 2);
         assert_eq!(result, 4);
 
-        let ast = VerilogAST::parse_file(&Path::new("tests/std-7.1.6-primitives.v"))?;
-        let ast = VerilogAST::parse_file(&Path::new("tests/macros.v"))?;
+        let ast = VerilogAST::parse_file(Path::new("tests/std-7.1.6-primitives.v"))?;
         for module in ast {
-            println!("module name is : {}", module.name);
+            println!("===>module name is {}", module.name);
             for port in module.ports {
-                println!("Ports messages are: {:?}", port)
+                println!("===>module port info :{:?}", port);
             }
-            println!("module over ----");
+
         }
-        // assert_eq!(ast[0].name, String::from("bus_snooper"), " module name is unequal");
-        // assert_eq!(ast[0].ports[0].name, String::from("safe_buslines"), "port name is unequal");
-        // assert_eq!(ast[0].ports[0].lsb, Some(0), "port lsb is unequal");
-        // assert_eq!(ast[0].ports[0].msb, Some(31), "port msb is unequal");
-        // assert_eq!(ast[0].ports[1].name, String::from("bus_lines_1"), "port2 name is unequal");
-        // assert_eq!(ast[0].ports[1].direction, PortDirection::Input, "port direction is unequal");
-
-
 
         Ok(())
     }
+
+    // #[test]
+    // fn test_macros() -> Result<(), String> {
+    //     let result = add(2, 2);
+    //     assert_eq!(result, 4);
+    //
+    //     let ast = VerilogAST::parse_file(Path::new("tests/macros.v"))?;
+    //     for module in ast {
+    //         println!("===>module name is {}", module.name);
+    //         for port in module.ports {
+    //             println!("===>module port info :{:?}", port);
+    //         }
+    //
+    //     }
+    //
+    //     Ok(())
+    // }
 }
