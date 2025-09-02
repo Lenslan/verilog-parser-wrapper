@@ -14,8 +14,8 @@ fn main() {
             format!("{}/verilog_ast_util.c", c_src_dir),
             format!("{}/verilog_parser_wrapper.c", c_src_dir),
             format!("{}/verilog_preprocessor.c", c_src_dir),
-            format!("build/verilog_parser.tab.c"),
-            format!("build/verilog_scanner.c"),
+            "build/verilog_parser.tab.c".to_string(),
+            "build/verilog_scanner.c".to_string(),
         ])
         .include(c_src_dir)
         .warnings(false)
@@ -24,9 +24,11 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header(format!("{}/verilog_parser.h", c_src_dir))
         .header(format!("{}/verilog_ast_mem.h", c_src_dir))
+        .header(format!("{}/verilog_ast_util.h", c_src_dir))
         .clang_arg(format!("-I{}", c_src_dir))
         .allowlist_function("verilog_parser_init")
         .allowlist_function("verilog_parse_file")
+        .allowlist_function("verilog_resolve_modules")
         .allowlist_function("ast_free_all")
         .allowlist_function("ast_list_get")
 

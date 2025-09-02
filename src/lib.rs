@@ -93,6 +93,7 @@ impl VerilogAST {
             return Err("Failed to parse Verilog syntax".to_string());
         }
 
+        unsafe { verilog_resolve_modules(yy_verilog_source_tree) }
         // 从全局变量 yy_verilog_source_tree 中提取数据
         let modules = Self::extract_modules_from_ast();
 
